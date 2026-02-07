@@ -1,5 +1,6 @@
 import hashlib
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -11,59 +12,53 @@ from src.analyzer import analyze_pdf_to_json, ai_is_enabled
 from src.storage import init_db, get_cached_analysis, save_analysis, db_path_default
 from src.viz import render_analysis
 
+_JST = timezone(timedelta(hours=9))
+
 # ----------------------------
 # Helpers
 # ----------------------------
 
-# 決算っぽいタイトル判定（ゆるめ）
 _KESSAN_RE = re.compile(
     r"(決算短信|四半期決算|通期決算|Financial Results|Earnings|Results)",
+    re.IGNORECASE,
+)
+_BRIEFING_RE = re.compile(
+    r"(決算説明|説明資料|presentation|briefing|supplement|補足|Fact\s*Book)",
     re.IGNORECASE,
 )
 
 def is_kessan(title: str) -> bool:
     return bool(_KESSAN_RE.search(title or ""))
 
+def is_briefing(title: str) -> bool:
+    return bool(_BRIEFING_RE.search(title or ""))
 
 def _parse_dt_any(value: Any) -> Optional[datetime]:
-    """
-    published_at の揺れに耐える：
-      - ISO: 2026-02-06T20:00:00Z / +09:00
-      - スペース区切り: 2026-02-06 20:00:00  (←JST想定)
-    返り値はUTC tz-aware datetime
-    """
     if not value:
         return None
     s = str(value).strip()
     if not s:
         return None
 
-    # ISO Z 対応
     s_iso = s.replace("Z", "+00:00")
     try:
         dt = datetime.fromisoformat(s_iso)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))  # tz無しはJST想定
+            dt = dt.replace(tzinfo=_JST)
         return dt.astimezone(timezone.utc)
     except Exception:
         pass
 
-    # "YYYY-MM-DD HH:MM:SS"
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
         try:
-            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone(timedelta(hours=9)))
+            dt = datetime.strptime(s, fmt).replace(tzinfo=_JST)
             return dt.astimezone(timezone.utc)
         except Exception:
             continue
-
     return None
 
 
 def _extract_tdnet_fields(it: Dict[str, Any]) -> Tuple[str, str, str, Optional[datetime]]:
-    """
-    it の正規化が壊れても app 側で復元する（壊れづらさ優先）。
-    戻り: (title, code, doc_url, published_at_utc)
-    """
     title = (it.get("title") or "").strip()
     code = str(it.get("code") or "").strip()
     doc_url = (it.get("doc_url") or "").strip()
@@ -72,7 +67,6 @@ def _extract_tdnet_fields(it: Dict[str, Any]) -> Tuple[str, str, str, Optional[d
     if not isinstance(published_at, datetime):
         published_at = _parse_dt_any(published_at)
 
-    # raw から救済（it["raw"] の下が Tdnet/TDnet/直下 など揺れる）
     raw = it.get("raw") if isinstance(it.get("raw"), dict) else {}
     td = None
     if isinstance(raw.get("Tdnet"), dict):
@@ -87,11 +81,8 @@ def _extract_tdnet_fields(it: Dict[str, Any]) -> Tuple[str, str, str, Optional[d
     if isinstance(td, dict):
         if not title:
             title = str(td.get("title") or td.get("Title") or "").strip()
-
-        # 4桁/5桁揺れ：company_code が 45230 みたいに末尾0のことがある
         if not code:
             code = str(td.get("code") or td.get("company_code") or td.get("Code") or "").strip()
-
         if not doc_url:
             doc_url = str(
                 td.get("document_url")
@@ -100,7 +91,6 @@ def _extract_tdnet_fields(it: Dict[str, Any]) -> Tuple[str, str, str, Optional[d
                 or td.get("url")
                 or ""
             ).strip()
-
         if published_at is None:
             published_at = _parse_dt_any(td.get("published_at") or td.get("pubdate") or td.get("date"))
 
@@ -108,10 +98,6 @@ def _extract_tdnet_fields(it: Dict[str, Any]) -> Tuple[str, str, str, Optional[d
 
 
 def _code4(code: str) -> str:
-    """
-    45230 -> 4523 みたいな救済（末尾0が付くパターン用）。
-    ただし必ずそうとは限らないので、表示は (元コード) も併記する。
-    """
     c = (code or "").strip()
     if len(c) == 5 and c.isdigit() and c.endswith("0"):
         return c[:-1]
@@ -121,11 +107,6 @@ def _code4(code: str) -> str:
 
 
 def _is_allowed_pdf_url(url: str) -> bool:
-    """
-    手動URL解析の安全策（壊れ防止）。
-    - release.tdnet.info のPDF
-    - yanoshin rd.php 経由で release.tdnet.info のPDF
-    """
     u = (url or "").strip()
     if not u:
         return False
@@ -138,10 +119,6 @@ def _is_allowed_pdf_url(url: str) -> bool:
 
 
 def _pdf_size_bytes(url: str, timeout: float = 10.0) -> Optional[int]:
-    """
-    HEAD で Content-Length を取得してPDFサイズ推定。
-    取れない/失敗は None。
-    """
     try:
         r = requests.head(url, allow_redirects=True, timeout=timeout)
         if r.status_code >= 400:
@@ -156,10 +133,6 @@ def _pdf_size_bytes(url: str, timeout: float = 10.0) -> Optional[int]:
 
 
 def _check_pdf_size_or_warn(url: str, max_bytes: int) -> bool:
-    """
-    max_bytes>0 のとき、判明する範囲でサイズ上限超をブロック。
-    不明なら警告して通す（最終防御は analyzer 側推奨）。
-    """
     if max_bytes <= 0:
         return True
     n = _pdf_size_bytes(url)
@@ -172,13 +145,35 @@ def _check_pdf_size_or_warn(url: str, max_bytes: int) -> bool:
     return True
 
 
+def _jst_date_key(published_utc: Optional[datetime]) -> str:
+    if isinstance(published_utc, datetime):
+        try:
+            return published_utc.astimezone(_JST).strftime("%Y-%m-%d")
+        except Exception:
+            return "unknown"
+    return "unknown"
+
+
+def _sort_key_with_unknown_last(date_key: str) -> Tuple[int, str]:
+    return (1, "") if date_key == "unknown" else (0, date_key)
+
+
+def _doc_rank(title: str) -> int:
+    # グループ内での並び順：短信 → 説明資料 → その他
+    if is_kessan(title):
+        return 0
+    if is_briefing(title):
+        return 1
+    return 2
+
+
 # ----------------------------
 # Page
 # ----------------------------
 st.set_page_config(page_title="決算短信スクリーナー", layout="wide")
 
 # ----------------------------
-# Auth (simple password gate)
+# Auth
 # ----------------------------
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 if not APP_PASSWORD:
@@ -197,7 +192,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ----------------------------
-# DB init (cache store)
+# DB init
 # ----------------------------
 DB_PATH = st.secrets.get("DB_PATH", db_path_default())
 init_db(DB_PATH)
@@ -232,7 +227,7 @@ with st.expander("スクリーニング条件", expanded=True):
 
     with col4:
         show_debug = st.checkbox("DEBUG表示（先頭5件のJSON）", value=False)
-        show_n = st.slider("画面に表示する件数", 20, 200, 100)
+        show_n_groups = st.slider("画面に表示するグループ数", 10, 200, 60)
 
 # sanity for code
 code = ""
@@ -243,13 +238,12 @@ if code_in:
         st.warning("銘柄コードは4桁の数字で入力してください（例：7203）")
 
 # ----------------------------
-# Fetch TDnet index (non-scrape) + cache
+# Fetch TDnet + cache
 # ----------------------------
 cutoff_utc = datetime.now(timezone.utc) - timedelta(days=days)
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_fetch_tdnet_items(code_: Optional[str], limit_: int) -> list[dict[str, Any]]:
-    # fetch_tdnet_items は外側で例外処理せず、ここで素直に返す
     return fetch_tdnet_items(code_, limit=limit_)
 
 with st.spinner("開示一覧を取得中..."):
@@ -297,13 +291,11 @@ def apply_filters(use_kessan: bool) -> list[dict[str, Any]]:
     return out
 
 filtered = apply_filters(only_kessan)
-
-# 0件なら自動で広めにする
 if only_kessan and not filtered:
     st.info("『決算短信だけ』で0件だったので、フィルタを広げて表示します。")
     filtered = apply_filters(False)
 
-st.subheader(f"候補：{len(filtered)}件")
+st.subheader(f"候補（資料数）：{len(filtered)}件")
 if not filtered:
     st.info("条件に一致する開示が見つかりませんでした。日数や件数、フィルタを調整してください。")
     st.stop()
@@ -311,67 +303,111 @@ if not filtered:
 # AI availability
 ai_ok = ai_is_enabled()
 if show_ai_button and not ai_ok:
-    st.warning("Gemini APIキー未設定のため、AI分析は無効です（数値表示のみ）。Secretsに GEMINI_API_KEY を設定してください。")
+    st.warning("Gemini APIキー未設定のため、AI分析は無効です。Secretsに GEMINI_API_KEY を設定してください。")
 
 # ----------------------------
-# Render list
+# Grouping: (code, date_jst)
 # ----------------------------
-for i, it in enumerate(filtered[:show_n]):
-    title = it.get("title", "")
-    code_ = it.get("code", "") or "----"
-    code_raw = it.get("code_raw", "") or ""
-    doc_url = (it.get("doc_url") or "").strip()
-    published = it.get("published_at")
+groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+for it in filtered:
+    code4 = it.get("code") or "----"
+    date_key = _jst_date_key(it.get("published_at"))
+    groups[(code4, date_key)].append(it)
 
-    # 表示用日時（UTC→JST）
-    if isinstance(published, datetime):
-        published_jst = published.astimezone(timezone(timedelta(hours=9)))
-        published_str = published_jst.strftime("%Y-%m-%d %H:%M JST")
+# sort groups: newest date first, unknown last
+group_keys = sorted(
+    groups.keys(),
+    key=lambda k: _sort_key_with_unknown_last(k[1]),
+    reverse=True,
+)
+
+st.subheader(f"表示グループ：{min(len(group_keys), show_n_groups)} / {len(group_keys)}")
+
+# ----------------------------
+# Render groups
+# ----------------------------
+for gi, gk in enumerate(group_keys[:show_n_groups]):
+    code4, date_key = gk
+    docs = groups[gk]
+
+    # グループ内の並び
+    docs_sorted = sorted(
+        docs,
+        key=lambda d: (_doc_rank(d.get("title", "")), (d.get("published_at") or datetime(1970, 1, 1, tzinfo=timezone.utc))),
+    )
+
+    # グループラベル（日時は最も新しいものを採用）
+    latest_dt = None
+    for d in docs_sorted:
+        if isinstance(d.get("published_at"), datetime):
+            latest_dt = d["published_at"]
+            break
+    if isinstance(latest_dt, datetime):
+        latest_str = latest_dt.astimezone(_JST).strftime("%Y-%m-%d %H:%M JST")
     else:
-        published_str = "日時不明"
+        latest_str = f"{date_key}（日時不明）"
 
-    # 一意キー（URLベース + index）
-    seed = f"{doc_url}|{published_str}|{title}|{i}"
-    uid = hashlib.md5(seed.encode("utf-8")).hexdigest()[:12]
+    group_label = f"{code4}｜{date_key}｜資料{len(docs_sorted)}件（最終: {latest_str}）"
 
-    label = f"{code_}({code_raw})｜{published_str}｜{title}"
-    with st.expander(label, expanded=False):
-        if doc_url:
-            st.caption(f"PDF: {doc_url}")
-            st.link_button("PDFを開く", doc_url)
-        else:
-            st.caption("PDF: （なし）")
+    with st.expander(group_label, expanded=False):
+        # まずはグループ概要
+        st.caption("同一銘柄・同日の資料をまとめて表示（短信→説明資料→その他の順）。")
 
-        cached = get_cached_analysis(DB_PATH, doc_url) if doc_url else None
-        if cached:
-            st.success("解析済み（キャッシュ）")
-            render_analysis(cached)
-            st.caption("※同じPDF URLはSQLiteに保存し、再解析しません（DBはキャッシュ扱い）。")
-            continue  # キャッシュがあればボタン不要（速さ優先）
+        for di, it in enumerate(docs_sorted):
+            title = it.get("title", "")
+            code_raw = it.get("code_raw", "") or ""
+            doc_url = (it.get("doc_url") or "").strip()
+            published = it.get("published_at")
 
-        st.info("未解析")
+            if isinstance(published, datetime):
+                published_str = published.astimezone(_JST).strftime("%Y-%m-%d %H:%M JST")
+            else:
+                published_str = "日時不明"
 
-        # AI分析可能条件：AI有効 + URLあり + 許可ドメイン
-        allowed = bool(doc_url) and _is_allowed_pdf_url(doc_url)
-        can_run_ai = show_ai_button and ai_ok and allowed
+            # 1資料ごとのUID
+            seed = f"{code4}|{date_key}|{doc_url}|{published_str}|{title}|{gi}|{di}"
+            uid = hashlib.md5(seed.encode("utf-8")).hexdigest()[:12]
 
-        if doc_url and not allowed:
-            st.warning("安全のため、このPDF URLはAI解析対象外です（release.tdnet.info もしくは yanoshin rd.php 経由のみ許可）。")
+            # 資料タイプバッジ
+            tag = "短信" if is_kessan(title) else ("説明" if is_briefing(title) else "資料")
 
-        run = st.button("AI分析", key=f"ai_{uid}", disabled=not can_run_ai)
+            st.markdown(f"---\n**[{tag}] {title}**  \n`{published_str}`  \nコード: {code4}({code_raw})")
 
-        if run:
-            if not _check_pdf_size_or_warn(doc_url, max_pdf_bytes):
-                st.stop()
+            if doc_url:
+                st.link_button("PDFを開く", doc_url, key=f"open_{uid}")
+                st.caption(f"PDF: {doc_url}")
+            else:
+                st.caption("PDF: （なし）")
 
-            with st.spinner("AIが決算短信を解析中..."):
-                try:
-                    payload = analyze_pdf_to_json(doc_url)
-                    save_analysis(DB_PATH, doc_url, code_, title, published, payload)
-                    st.success("解析完了")
-                    render_analysis(payload)
-                except Exception as e:
-                    st.error(f"解析エラー: {type(e).__name__}: {e}")
+            # キャッシュ表示
+            cached = get_cached_analysis(DB_PATH, doc_url) if doc_url else None
+            if cached:
+                st.success("解析済み（キャッシュ）")
+                render_analysis(cached)
+                continue
+
+            st.info("未解析")
+
+            allowed = bool(doc_url) and _is_allowed_pdf_url(doc_url)
+            can_run_ai = show_ai_button and ai_ok and allowed
+
+            if doc_url and not allowed:
+                st.warning("安全のため、このPDF URLはAI解析対象外です（release.tdnet.info もしくは yanoshin rd.php 経由のみ許可）。")
+
+            run = st.button("AI分析", key=f"ai_{uid}", disabled=not can_run_ai)
+
+            if run:
+                if not _check_pdf_size_or_warn(doc_url, max_pdf_bytes):
+                    st.stop()
+
+                with st.spinner("AIが決算短信を解析中..."):
+                    try:
+                        payload = analyze_pdf_to_json(doc_url)
+                        save_analysis(DB_PATH, doc_url, code4, title, published, payload)
+                        st.success("解析完了")
+                        render_analysis(payload)
+                    except Exception as e:
+                        st.error(f"解析エラー: {type(e).__name__}: {e}")
 
 st.divider()
 
@@ -405,7 +441,6 @@ if manual_run:
         with st.spinner("AIが解析中..."):
             try:
                 payload = analyze_pdf_to_json(manual)
-                # 手動はコード等が分からないので空で保存（URLキャッシュとして十分）
                 save_analysis(DB_PATH, manual, "", "manual", None, payload)
                 st.success("解析完了")
                 render_analysis(payload)
