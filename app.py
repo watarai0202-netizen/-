@@ -17,6 +17,8 @@ from src.viz import render_analysis
 # Helpers
 # ----------------------------
 
+_JST = timezone(timedelta(hours=9))
+
 # 決算っぽいタイトル判定（ゆるめ）
 _KESSAN_RE = re.compile(
     r"(決算短信|四半期決算|通期決算|Financial Results|Earnings|Results)",
@@ -46,7 +48,7 @@ def _parse_dt_any(value: Any) -> Optional[datetime]:
     try:
         dt = datetime.fromisoformat(s_iso)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))  # tz無しはJST想定
+            dt = dt.replace(tzinfo=_JST)  # tz無しはJST想定
         return dt.astimezone(timezone.utc)
     except Exception:
         pass
@@ -54,7 +56,7 @@ def _parse_dt_any(value: Any) -> Optional[datetime]:
     # "YYYY-MM-DD HH:MM:SS" / "YYYY/MM/DD HH:MM:SS"
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
         try:
-            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone(timedelta(hours=9)))
+            dt = datetime.strptime(s, fmt).replace(tzinfo=_JST)
             return dt.astimezone(timezone.utc)
         except Exception:
             continue
@@ -62,15 +64,24 @@ def _parse_dt_any(value: Any) -> Optional[datetime]:
     return None
 
 
-def _extract_tdnet_fields(it: Dict[str, Any]) -> Tuple[str, str, str, Optional[datetime]]:
+def _extract_tdnet_fields(it: Dict[str, Any]) -> Tuple[str, str, str, Optional[datetime], str]:
     """
     it の正規化が壊れても app 側で復元する（壊れづらさ優先）。
-    戻り: (title, code, doc_url, published_at_utc)
+    戻り: (title, code_raw, doc_url, published_at_utc, company_name)
     """
     title = (it.get("title") or "").strip()
-    code = str(it.get("code") or "").strip()
-    doc_url = (it.get("doc_url") or "").strip()
-    published_at = it.get("published_at")
+
+    # codeは揺れるので広めに拾う（code/company_code/code4）
+    code = str(
+        it.get("code")
+        or it.get("company_code")
+        or it.get("code4")
+        or ""
+    ).strip()
+
+    company_name = str(it.get("company_name") or it.get("name") or "").strip()
+    doc_url = (it.get("doc_url") or it.get("document_url") or it.get("url") or "").strip()
+    published_at = it.get("published_at") or it.get("pubdate") or it.get("date")
 
     if not isinstance(published_at, datetime):
         published_at = _parse_dt_any(published_at)
@@ -91,9 +102,23 @@ def _extract_tdnet_fields(it: Dict[str, Any]) -> Tuple[str, str, str, Optional[d
         if not title:
             title = str(td.get("title") or td.get("Title") or "").strip()
 
+        if not company_name:
+            company_name = str(
+                td.get("company_name")
+                or td.get("CompanyName")
+                or td.get("name")
+                or ""
+            ).strip()
+
         # 4桁/5桁揺れ：company_code が 45230 みたいに末尾0のことがある
         if not code:
-            code = str(td.get("code") or td.get("company_code") or td.get("Code") or "").strip()
+            code = str(
+                td.get("code")
+                or td.get("company_code")
+                or td.get("Code")
+                or td.get("code4")
+                or ""
+            ).strip()
 
         if not doc_url:
             doc_url = str(
@@ -107,7 +132,7 @@ def _extract_tdnet_fields(it: Dict[str, Any]) -> Tuple[str, str, str, Optional[d
         if published_at is None:
             published_at = _parse_dt_any(td.get("published_at") or td.get("pubdate") or td.get("date"))
 
-    return title, code, doc_url, published_at
+    return title, code, doc_url, published_at, company_name
 
 
 def _code4(code: str) -> str:
@@ -279,7 +304,7 @@ with st.spinner("開示一覧を取得中..."):
     items = _cached_fetch_tdnet_items(code or None, limit)
 
 if show_debug:
-    st.subheader("DEBUG: items 先頭5件（title/code/doc_url/link の揺れ確認）")
+    st.subheader("DEBUG: items 先頭5件（title/code/doc_url/link/company_name の揺れ確認）")
     st.json(items[:5])
 
 # ----------------------------
@@ -289,12 +314,14 @@ normalized: list[dict[str, Any]] = []
 for it in items:
     if not isinstance(it, dict):
         continue
-    title, code_raw, doc_url, published_at = _extract_tdnet_fields(it)
+
+    title, code_raw, doc_url, published_at, company_name = _extract_tdnet_fields(it)
     code4 = _code4(code_raw)
 
     normalized.append(
         {
             "title": title,
+            "company_name": company_name,
             "code": code4,
             "code_raw": code_raw,
             "doc_url": doc_url,
@@ -343,6 +370,7 @@ if show_ai_button and not ai_ok:
 # ----------------------------
 for i, it in enumerate(filtered[:show_n]):
     title = it.get("title", "")
+    company_name = (it.get("company_name") or "").strip()
     code_ = it.get("code", "") or "----"
     code_raw = it.get("code_raw", "") or ""
     doc_url = (it.get("doc_url") or "").strip()
@@ -350,7 +378,7 @@ for i, it in enumerate(filtered[:show_n]):
 
     # 表示用日時（UTC→JST）
     if isinstance(published, datetime):
-        published_jst = published.astimezone(timezone(timedelta(hours=9)))
+        published_jst = published.astimezone(_JST)
         published_str = published_jst.strftime("%Y-%m-%d %H:%M JST")
     else:
         published_str = "日時不明"
@@ -359,7 +387,10 @@ for i, it in enumerate(filtered[:show_n]):
     seed = f"{doc_url}|{published_str}|{title}|{i}"
     uid = hashlib.md5(seed.encode("utf-8")).hexdigest()[:12]
 
-    label = f"{code_}({code_raw})｜{published_str}｜{title}"
+    # 会社名があればコード横に出す
+    name_part = f" {company_name}" if company_name else ""
+    label = f"{code_}{name_part}({code_raw})｜{published_str}｜{title}"
+
     with st.expander(label, expanded=False):
         # --- PDFリンク（安全表示） ---
         _safe_pdf_link(doc_url)
