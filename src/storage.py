@@ -3,21 +3,22 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 
 def db_path_default() -> str:
-    # Streamlit Cloudでも書き込み可能な場所をデフォルトに
     return "/tmp/app.db"
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
-    # 同時アクセス耐性ちょい改善
     con = sqlite3.connect(db_path, timeout=30)
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
     return con
+
+
+_JST = timezone(timedelta(hours=9))
 
 
 def init_db(db_path: str) -> None:
@@ -27,7 +28,6 @@ def init_db(db_path: str) -> None:
     con = _connect(db_path)
     cur = con.cursor()
 
-    # 既存互換のまま作成
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS analyses (
@@ -41,10 +41,20 @@ def init_db(db_path: str) -> None:
         """
     )
 
-    # ---- 追加カラム（存在しなければ追加）----
+    # 追加カラム（既存互換）
     _ensure_column(cur, "analyses", "model", "TEXT")
     _ensure_column(cur, "analyses", "tokens", "INTEGER")
     _ensure_column(cur, "analyses", "schema_version", "INTEGER")
+
+    # ★グルーピング用（新規）
+    _ensure_column(cur, "analyses", "code4", "TEXT")
+    _ensure_column(cur, "analyses", "published_date_jst", "TEXT")  # YYYY-MM-DD
+    _ensure_column(cur, "analyses", "doc_type", "TEXT")            # kessan / briefing / other
+
+    # ★検索を速くするINDEX（存在しなければ作成）
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_analyses_code4_date ON analyses(code4, published_date_jst)"
+    )
 
     con.commit()
     con.close()
@@ -52,7 +62,7 @@ def init_db(db_path: str) -> None:
 
 def _ensure_column(cur: sqlite3.Cursor, table: str, col: str, coltype: str) -> None:
     cur.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in cur.fetchall()]  # r[1] = name
+    cols = [r[1] for r in cur.fetchall()]
     if col in cols:
         return
     cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
@@ -65,10 +75,12 @@ def get_cached_analysis(db_path: str, doc_url: str) -> dict | None:
     con = _connect(db_path)
     cur = con.cursor()
 
-    # 新カラムが無い古いDBでも動くように、まずpayload_jsonだけ取る
     try:
         cur.execute(
-            "SELECT payload_json, model, tokens, schema_version FROM analyses WHERE doc_url=?",
+            """
+            SELECT payload_json, model, tokens, schema_version, code4, published_date_jst, doc_type
+            FROM analyses WHERE doc_url=?
+            """,
             (doc_url,),
         )
         row = cur.fetchone()
@@ -77,31 +89,33 @@ def get_cached_analysis(db_path: str, doc_url: str) -> dict | None:
             return None
 
         payload_raw = row[0]
-        model = row[1]
-        tokens = row[2]
-        schema_version = row[3]
+        model, tokens, schema_version = row[1], row[2], row[3]
+        code4, date_jst, doc_type = row[4], row[5], row[6]
     except Exception:
-        # 古いスキーマ
         cur.execute("SELECT payload_json FROM analyses WHERE doc_url=?", (doc_url,))
         row = cur.fetchone()
         con.close()
         if not row:
             return None
         payload_raw = row[0]
-        model = None
-        tokens = None
-        schema_version = None
+        model = tokens = schema_version = code4 = date_jst = doc_type = None
 
     try:
         payload = json.loads(payload_raw)
         if isinstance(payload, dict):
-            # DBメタがあれば補完（payload側に無ければ）
             if model and "model" not in payload:
                 payload["model"] = model
             if tokens is not None and "tokens" not in payload:
                 payload["tokens"] = tokens
             if schema_version is not None and "schema_version" not in payload:
                 payload["schema_version"] = schema_version
+            # ★DB側の束ねキーも補完
+            if code4 and "code4" not in payload:
+                payload["code4"] = code4
+            if date_jst and "published_date_jst" not in payload:
+                payload["published_date_jst"] = date_jst
+            if doc_type and "doc_type" not in payload:
+                payload["doc_type"] = doc_type
         return payload if isinstance(payload, dict) else None
     except Exception:
         return None
@@ -115,113 +129,34 @@ def save_analysis(
     published_at,
     payload: dict,
 ) -> None:
-    """
-    payload_json はそのまま保存（後方互換維持）。
-    追加で model/tokens/schema_version を「取れる範囲で」保存。
-    """
     if not doc_url:
         return
 
     published_str = ""
+    date_jst = ""
     if published_at is not None:
         try:
             published_str = published_at.astimezone(timezone.utc).isoformat()
+            date_jst = published_at.astimezone(_JST).strftime("%Y-%m-%d")
         except Exception:
             published_str = str(published_at)
+            date_jst = ""
+    # code4 は code を優先（app.pyではcode=4桁に寄せてる）
+    code4 = (code or "").strip()[:4] if (code or "").strip() else ""
 
     model = _infer_model(payload)
     tokens = _infer_tokens(payload)
     schema_version = _infer_schema_version(payload)
+    doc_type = _infer_doc_type(title, payload)
 
     con = _connect(db_path)
     cur = con.cursor()
 
-    # 追加カラムがない古いDBでも落ちないように、tryで分岐
     try:
         cur.execute(
             """
             INSERT OR REPLACE INTO analyses
-              (doc_url, code, title, published_at, payload_json, created_at, model, tokens, schema_version)
-            VALUES (?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                doc_url,
-                code,
-                title,
-                published_str,
-                json.dumps(payload, ensure_ascii=False),
-                datetime.now(timezone.utc).isoformat(),
-                model,
-                tokens,
-                schema_version,
-            ),
-        )
-    except Exception:
-        # 古いDB（追加カラムなし）向け
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO analyses
-              (doc_url, code, title, published_at, payload_json, created_at)
-            VALUES (?,?,?,?,?,?)
-            """,
-            (
-                doc_url,
-                code,
-                title,
-                published_str,
-                json.dumps(payload, ensure_ascii=False),
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-
-    con.commit()
-    con.close()
-
-
-# ----------------------------
-# inference helpers
-# ----------------------------
-
-def _infer_model(payload: dict) -> Optional[str]:
-    if not isinstance(payload, dict):
-        return None
-    v = payload.get("model")
-    return str(v).strip() if v else None
-
-
-def _infer_tokens(payload: dict) -> Optional[int]:
-    if not isinstance(payload, dict):
-        return None
-    v = payload.get("tokens")
-    if isinstance(v, int):
-        return v
-    # usage_metadataをresultに入れる設計にしたくなった時の保険
-    try:
-        if isinstance(v, str) and v.isdigit():
-            return int(v)
-    except Exception:
-        pass
-    return None
-
-
-def _infer_schema_version(payload: dict) -> Optional[int]:
-    """
-    あなたの新スキーマは:
-      payload = {ok, pdf_url, model, tokens, result:{...}}
-    という構造なので、とりあえず version=2 扱いにする。
-    旧payloadは version=1 の想定。
-    """
-    if not isinstance(payload, dict):
-        return None
-    if "schema_version" in payload and isinstance(payload["schema_version"], int):
-        return payload["schema_version"]
-
-    # 新スキーマ判定
-    if isinstance(payload.get("result"), dict):
-        return 2
-
-    # 旧スキーマっぽいキー
-    if any(k in payload for k in ("summary_1min", "headline", "watch_points")):
-        return 1
-
-    return None
+              (doc_url, code, title, published_at, payload_json, created_at,
+               model, tokens, schema_version,
+               code4, published_date_jst, doc_type)
+            VALUES (?,?,
