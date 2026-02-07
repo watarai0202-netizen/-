@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 import requests
 import streamlit as st
 
-from src.tdnet_api import fetch_tdnet_items
+from src.tdnet import fetch_tdnet_items
 
 
 # -----------------------------
