@@ -1,47 +1,88 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import requests
 
-# PDF抽出（requirementsに pypdf を入れてね）
+# PDF抽出（requirements: pypdf）
 try:
     from pypdf import PdfReader
 except Exception:
     PdfReader = None  # type: ignore
 
+# Gemini SDK（requirements: google-genai）
+try:
+    from google import genai
+except Exception:
+    genai = None  # type: ignore
+
+
+# ----------------------------
+# Public API (used by app.py)
+# ----------------------------
+
+def ai_is_enabled() -> bool:
+    """Gemini APIキーが設定されているか（Secrets/ENV両対応想定）"""
+    key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    return bool(key)
+
+
+def analyze_pdf_to_json(
+    pdf_url: str,
+    *,
+    gemini_api_key: Optional[str] = None,
+    gemini_model: Optional[str] = None,
+    max_pdf_bytes: Optional[int] = None,
+) -> dict[str, Any]:
+    """
+    app.py から呼ばれる想定。
+    決算短信PDFをDL→テキスト抽出→GeminiでJSON要約→dictで返す。
+    """
+    key = (gemini_api_key or os.getenv("GEMINI_API_KEY") or "").strip()
+    model = (gemini_model or os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+    limit = int(max_pdf_bytes or (os.getenv("MAX_PDF_BYTES") or 0) or 0)
+    if limit <= 0:
+        # 無指定時の安全なデフォルト（20MB）
+        limit = 20 * 1024 * 1024
+
+    res = summarize_kessan_pdf_to_json(
+        pdf_url=pdf_url,
+        gemini_api_key=key,
+        gemini_model=model,
+        max_pdf_bytes=limit,
+    )
+
+    if not res.ok:
+        # render側が落ちないよう、エラーでも一定の形で返す
+        return {
+            "ok": False,
+            "error": res.error,
+            "model": model,
+            "pdf_url": pdf_url,
+        }
+
+    return res.payload
+
+
+# ----------------------------
+# Internal data structures
+# ----------------------------
 
 @dataclass
 class AnalyzeResult:
     ok: bool
-    text: str
     error: str = ""
     tokens: Optional[int] = None
+    payload: Optional[dict[str, Any]] = None
 
 
-def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 30) -> str:
-    if PdfReader is None:
-        return "PDF抽出ライブラリ(pypdf)が未インストールです。requirements に `pypdf` を追加してください。"
-
-    try:
-        reader = PdfReader(io_bytes := _bytes_to_filelike(pdf_bytes))
-        texts: list[str] = []
-        pages = reader.pages[:max_pages]
-        for p in pages:
-            t = p.extract_text() or ""
-            if t.strip():
-                texts.append(t)
-        return "\n\n".join(texts).strip()
-    except Exception as e:
-        return f"PDF抽出に失敗しました: {e}"
-
-
-def _bytes_to_filelike(b: bytes):
-    import io
-    return io.BytesIO(b)
-
+# ----------------------------
+# PDF: download + extract
+# ----------------------------
 
 def download_pdf(url: str, max_bytes: int) -> tuple[bytes | None, str]:
     """
@@ -52,11 +93,17 @@ def download_pdf(url: str, max_bytes: int) -> tuple[bytes | None, str]:
         return None, "PDF URLが空です。"
 
     try:
-        with requests.get(u, stream=True, timeout=35, headers={"User-Agent": "Mozilla/5.0"}) as r:
+        with requests.get(
+            u,
+            stream=True,
+            timeout=35,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as r:
             r.raise_for_status()
 
             total = 0
             chunks: list[bytes] = []
+
             for chunk in r.iter_content(chunk_size=1024 * 128):
                 if not chunk:
                     continue
@@ -70,56 +117,123 @@ def download_pdf(url: str, max_bytes: int) -> tuple[bytes | None, str]:
         return None, f"PDFダウンロード失敗: {e}"
 
 
-def gemini_generate(
+def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 35) -> tuple[str, str]:
+    """
+    返り値: (text, err)
+    """
+    if PdfReader is None:
+        return "", "PDF抽出ライブラリ(pypdf)が未インストールです。requirements に `pypdf` を追加してください。"
+
+    try:
+        import io
+
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+
+        # 暗号化PDF対策（パス無しで開けるケースだけ try）
+        try:
+            if getattr(reader, "is_encrypted", False):
+                reader.decrypt("")  # type: ignore
+        except Exception:
+            pass
+
+        texts: list[str] = []
+        pages = reader.pages[:max_pages]
+        for p in pages:
+            t = p.extract_text() or ""
+            if t.strip():
+                texts.append(t)
+
+        out = "\n\n".join(texts).strip()
+        if not out:
+            return "", "PDFからテキストを抽出できませんでした（空）。図表中心PDFの可能性があります。"
+        return out, ""
+    except Exception as e:
+        return "", f"PDF抽出に失敗しました: {e}"
+
+
+# ----------------------------
+# Gemini: generate JSON
+# ----------------------------
+
+def _gemini_generate_json(
     api_key: str,
     model: str,
     prompt: str,
+    *,
     temperature: float = 0.2,
-) -> AnalyzeResult:
+    max_retries: int = 3,
+    retry_sleep: float = 1.2,
+) -> Tuple[Optional[dict[str, Any]], Optional[int], str]:
     """
-    Gemini API（Generative Language API）をRESTで呼ぶ
+    google-genai SDKで application/json を返させる。
+    返り値: (json_dict, tokens, err)
     """
     api_key = (api_key or "").strip()
     if not api_key:
-        return AnalyzeResult(ok=False, text="", error="GEMINI_API_KEY が未設定です。")
+        return None, None, "GEMINI_API_KEY が未設定です。"
+    if genai is None:
+        return None, None, "google-genai が未インストールです。requirements.txt を確認してください。"
 
     model = (model or "").strip() or "gemini-2.0-flash"
 
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    # SDKクライアント
+    client = genai.Client(api_key=api_key)
 
-    payload: dict[str, Any] = {
-        "contents": [
-            {"role": "user", "parts": [{"text": prompt}]}
-        ],
-        "generationConfig": {
-            "temperature": float(temperature),
-        },
-    }
+    last_err = ""
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config={
+                    "temperature": float(temperature),
+                    # JSONで返させる（重要）
+                    "response_mime_type": "application/json",
+                },
+            )
 
-    try:
-        r = requests.post(endpoint, json=payload, timeout=60)
-        r.raise_for_status()
-        data = r.json()
+            # google-genaiの返却は resp.text に JSON文字列が入ることが多い
+            raw = (getattr(resp, "text", None) or "").strip()
+            if not raw:
+                return None, None, "Geminiの返答が空です。"
 
-        # candidates[0].content.parts[0].text
-        candidates = data.get("candidates") or []
-        if not candidates:
-            return AnalyzeResult(ok=False, text="", error=f"Geminiの返答が空です: {json.dumps(data)[:500]}")
+            # JSONパース
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                # たまに ```json ... ``` で返すモデルがあるので救済
+                cleaned = raw.strip().strip("`")
+                cleaned = cleaned.replace("json\n", "", 1) if cleaned.lower().startswith("json\n") else cleaned
+                try:
+                    obj = json.loads(cleaned)
+                except Exception:
+                    return None, None, f"GeminiのJSONパースに失敗しました。先頭: {raw[:200]}"
 
-        parts = (((candidates[0] or {}).get("content") or {}).get("parts") or [])
-        if not parts:
-            return AnalyzeResult(ok=False, text="", error=f"Gemini partsが空です: {json.dumps(data)[:500]}")
+            # トークン（取れる時だけ）
+            tokens = None
+            usage = getattr(resp, "usage_metadata", None)
+            if usage is not None:
+                # usage_metadataの形が環境で変わるので雑に拾う
+                tokens = getattr(usage, "total_token_count", None) or getattr(usage, "total_tokens", None)
 
-        text = (parts[0] or {}).get("text") or ""
-        if not str(text).strip():
-            return AnalyzeResult(ok=False, text="", error="Geminiの返答テキストが空です。")
+            return obj, tokens, ""
 
-        return AnalyzeResult(ok=True, text=str(text).strip())
-    except Exception as e:
-        return AnalyzeResult(ok=False, text="", error=f"Gemini呼び出し失敗: {e}")
+        except Exception as e:
+            last_err = str(e)
+            # 軽いリトライ（429/503などを想定）
+            if attempt < max_retries:
+                time.sleep(retry_sleep * attempt)
+                continue
+            break
+
+    return None, None, f"Gemini呼び出し失敗: {last_err}"
 
 
-def summarize_kessan_pdf(
+# ----------------------------
+# Main summarizer
+# ----------------------------
+
+def summarize_kessan_pdf_to_json(
     pdf_url: str,
     gemini_api_key: str,
     gemini_model: str,
@@ -127,34 +241,89 @@ def summarize_kessan_pdf(
 ) -> AnalyzeResult:
     pdf_bytes, err = download_pdf(pdf_url, max_bytes=max_pdf_bytes)
     if pdf_bytes is None:
-        return AnalyzeResult(ok=False, text="", error=err)
+        return AnalyzeResult(ok=False, error=err)
 
-    text = extract_text_from_pdf_bytes(pdf_bytes, max_pages=35)
-    if not text or "失敗" in text[:50] or "未インストール" in text[:100]:
-        # 抽出失敗の可能性が高い場合はそのまま返す
-        if "PDF抽出" in text or "未インストール" in text or "失敗" in text:
-            return AnalyzeResult(ok=False, text="", error=text)
-        return AnalyzeResult(ok=False, text="", error="PDFからテキストを抽出できませんでした。")
+    text, err = extract_text_from_pdf_bytes(pdf_bytes, max_pages=35)
+    if err:
+        return AnalyzeResult(ok=False, error=err)
+
+    # 入れすぎると遅い・コスト増なので上限を設ける（必要なら調整）
+    text = text[:160000]
 
     prompt = f"""
 あなたは日本株の決算短信を読むプロのアナリストです。
-以下はTDnetの決算短信PDFから抽出したテキストです。重要ポイントを短く、投資判断に使える形で整理してください。
+以下はTDnetの決算短信PDFから抽出したテキストです。
+投資判断に使えるように「必ずJSONのみ」で整理してください。
 
-【必須フォーマット】
-- サマリ（3行以内）
-- 業績ハイライト（売上/営業利益/経常/純利益。前年同期比・通期進捗・上方下方修正があれば明記）
-- ガイダンス（通期予想、修正有無、前提）
-- 注目ポイント（3〜6個：増減要因、セグメント、コスト、在庫、為替、特殊要因など）
-- リスク/懸念（2〜5個）
-- 次に見るべき資料（決算説明資料、IR、質疑、補足など）
+【出力ルール】
+- 出力は JSON オブジェクトのみ（説明文やMarkdown禁止）
+- 文字列は日本語
+- 数値は可能なら number（不明なら null）
+- YOY/進捗/修正など、見つかったものだけ埋める（不明は null）
+- 文章は短く、箇条書きは配列にする
+
+【JSONスキーマ（厳守）】
+{{
+  "ok": true,
+  "summary": "3行以内",
+  "performance": {{
+    "sales": null,
+    "op_profit": null,
+    "ordinary_profit": null,
+    "net_profit": null,
+    "yoy": {{
+      "sales": null,
+      "op_profit": null,
+      "ordinary_profit": null,
+      "net_profit": null
+    }},
+    "progress_full_year": {{
+      "sales": null,
+      "op_profit": null,
+      "ordinary_profit": null,
+      "net_profit": null
+    }},
+    "revision": {{
+      "exists": null,
+      "direction": null,
+      "reason": null
+    }}
+  }},
+  "guidance": {{
+    "full_year_forecast": {{
+      "sales": null,
+      "op_profit": null,
+      "ordinary_profit": null,
+      "net_profit": null
+    }},
+    "assumptions": ["..."],
+    "notes": "..."
+  }},
+  "highlights": ["..."],
+  "risks": ["..."],
+  "next_to_check": ["..."]
+}}
 
 【テキスト】
-{text[:180000]}
+{text}
 """.strip()
 
-    return gemini_generate(
+    obj, tokens, err = _gemini_generate_json(
         api_key=gemini_api_key,
         model=gemini_model,
         prompt=prompt,
         temperature=0.2,
+        max_retries=3,
     )
+    if obj is None:
+        return AnalyzeResult(ok=False, error=err)
+
+    # 最低限のメタを付与（vizやDBで便利）
+    payload: dict[str, Any] = {
+        "ok": True,
+        "pdf_url": pdf_url,
+        "model": gemini_model,
+        "tokens": tokens,
+        "result": obj,
+    }
+    return AnalyzeResult(ok=True, payload=payload, tokens=tokens)
