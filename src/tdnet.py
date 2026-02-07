@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse
 
 import requests
 
@@ -54,7 +53,6 @@ def _unwrap_doc_url(url: str) -> str:
     if not u:
         return ""
 
-    # 典型: rd.php?https://....
     if "webapi.yanoshin.jp/rd.php?" in u:
         try:
             return u.split("rd.php?", 1)[1].strip()
@@ -64,20 +62,42 @@ def _unwrap_doc_url(url: str) -> str:
     return u
 
 
+def _pick_td_block(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    レスポンスの揺れ対策：
+    - "TDnet"
+    - "Tdnet"
+    - "tdnet"
+    のどれでも拾う
+    """
+    for k in ("TDnet", "Tdnet", "tdnet"):
+        v = raw.get(k)
+        if isinstance(v, dict):
+            return v
+    return raw
+
+
 def _normalize_item(raw: dict[str, Any]) -> dict[str, Any]:
     """
     APIレスポンスの揺れに耐える正規化。
     """
-    td = raw.get("TDnet") if isinstance(raw.get("TDnet"), dict) else raw
+    td = _pick_td_block(raw)
 
     title = td.get("title") or td.get("Title") or ""
     company_name = td.get("company_name") or td.get("companyName") or ""
 
     # 4桁/5桁の揺れ対策
-    company_code = str(td.get("company_code") or td.get("companyCode") or td.get("code") or "").strip()
+    company_code = str(
+        td.get("company_code")
+        or td.get("companyCode")
+        or td.get("code")
+        or ""
+    ).strip()
+
     code = str(td.get("code") or td.get("Code") or "").strip()
     code4 = _to_code4(company_code, code)
 
+    # URLキーが揺れた場合に備える
     doc_url = (
         td.get("document_url")
         or td.get("documentUrl")
@@ -90,14 +110,13 @@ def _normalize_item(raw: dict[str, Any]) -> dict[str, Any]:
     published_raw = td.get("published_at") or td.get("pubdate") or td.get("date") or ""
     published_at = _parse_dt_maybe(str(published_raw))
 
-    # link というキーを使ってる古いコードがあっても壊れないように
     link = td.get("link") or ""
 
     return {
         "title": str(title),
         "company_name": str(company_name),
-        "company_code": company_code,
-        "code": code4,  # UIではこれを主に使う（4桁）
+        "company_code": company_code,  # 5桁が来ることもある
+        "code": code4,                 # UIで使うのは4桁
         "code4": code4,
         "doc_url": str(doc_url),
         "link": str(link),
