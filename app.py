@@ -3,6 +3,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
+import requests
 import streamlit as st
 
 from src.tdnet import fetch_tdnet_items
@@ -42,8 +43,7 @@ def _parse_dt_any(value: Any) -> Optional[datetime]:
     try:
         dt = datetime.fromisoformat(s_iso)
         if dt.tzinfo is None:
-            # tz無しはJST想定（TDnetのpubdateがこのパターン多い）
-            dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))
+            dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))  # tz無しはJST想定
         return dt.astimezone(timezone.utc)
     except Exception:
         pass
@@ -69,7 +69,6 @@ def _extract_tdnet_fields(it: Dict[str, Any]) -> Tuple[str, str, str, Optional[d
     doc_url = (it.get("doc_url") or "").strip()
     published_at = it.get("published_at")
 
-    # published_at が datetime で来てなければパース
     if not isinstance(published_at, datetime):
         published_at = _parse_dt_any(published_at)
 
@@ -138,6 +137,41 @@ def _is_allowed_pdf_url(url: str) -> bool:
     return False
 
 
+def _pdf_size_bytes(url: str, timeout: float = 10.0) -> Optional[int]:
+    """
+    HEAD で Content-Length を取得してPDFサイズ推定。
+    取れない/失敗は None。
+    """
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=timeout)
+        if r.status_code >= 400:
+            return None
+        cl = r.headers.get("Content-Length")
+        if not cl:
+            return None
+        n = int(cl)
+        return n if n > 0 else None
+    except Exception:
+        return None
+
+
+def _check_pdf_size_or_warn(url: str, max_bytes: int) -> bool:
+    """
+    max_bytes>0 のとき、判明する範囲でサイズ上限超をブロック。
+    不明なら警告して通す（最終防御は analyzer 側推奨）。
+    """
+    if max_bytes <= 0:
+        return True
+    n = _pdf_size_bytes(url)
+    if n is None:
+        st.warning("PDFサイズ（Content-Length）が取得できませんでした。上限超の可能性がある場合は解析に失敗することがあります。")
+        return True
+    if n > max_bytes:
+        st.error(f"PDFが上限を超えています：{n/1024/1024:.1f}MB > {max_bytes/1024/1024:.1f}MB")
+        return False
+    return True
+
+
 # ----------------------------
 # Page
 # ----------------------------
@@ -182,7 +216,7 @@ else:
 # Screening controls
 # ----------------------------
 with st.expander("スクリーニング条件", expanded=True):
-    col1, col2, col3 = st.columns([2, 2, 2])
+    col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
 
     with col1:
         code_in = st.text_input("銘柄コード（4桁、空なら直近全体）", value="").strip()
@@ -195,7 +229,10 @@ with st.expander("スクリーニング条件", expanded=True):
     with col3:
         only_has_doc_url = st.checkbox("PDF URLがあるものだけ", value=False)
         show_ai_button = st.checkbox("AI分析ボタンを表示", value=True)
+
+    with col4:
         show_debug = st.checkbox("DEBUG表示（先頭5件のJSON）", value=False)
+        show_n = st.slider("画面に表示する件数", 20, 200, 100)
 
 # sanity for code
 code = ""
@@ -206,11 +243,17 @@ if code_in:
         st.warning("銘柄コードは4桁の数字で入力してください（例：7203）")
 
 # ----------------------------
-# Fetch TDnet index (non-scrape)
+# Fetch TDnet index (non-scrape) + cache
 # ----------------------------
 cutoff_utc = datetime.now(timezone.utc) - timedelta(days=days)
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_fetch_tdnet_items(code_: Optional[str], limit_: int) -> list[dict[str, Any]]:
+    # fetch_tdnet_items は外側で例外処理せず、ここで素直に返す
+    return fetch_tdnet_items(code_, limit=limit_)
+
 with st.spinner("開示一覧を取得中..."):
-    items = fetch_tdnet_items(code or None, limit=limit)
+    items = _cached_fetch_tdnet_items(code or None, limit)
 
 if show_debug:
     st.subheader("DEBUG: items 先頭5件（title/code/doc_url/link の揺れ確認）")
@@ -273,8 +316,7 @@ if show_ai_button and not ai_ok:
 # ----------------------------
 # Render list
 # ----------------------------
-# スマホ前提：1件ずつ expander で開く UI
-for i, it in enumerate(filtered[:100]):
+for i, it in enumerate(filtered[:show_n]):
     title = it.get("title", "")
     code_ = it.get("code", "") or "----"
     code_raw = it.get("code_raw", "") or ""
@@ -288,8 +330,8 @@ for i, it in enumerate(filtered[:100]):
     else:
         published_str = "日時不明"
 
-    # 一意キー（DuplicateElementKey対策）
-    seed = f"{code_}|{code_raw}|{published_str}|{title}|{doc_url}|{i}"
+    # 一意キー（URLベース + index）
+    seed = f"{doc_url}|{published_str}|{title}|{i}"
     uid = hashlib.md5(seed.encode("utf-8")).hexdigest()[:12]
 
     label = f"{code_}({code_raw})｜{published_str}｜{title}"
@@ -304,23 +346,24 @@ for i, it in enumerate(filtered[:100]):
         if cached:
             st.success("解析済み（キャッシュ）")
             render_analysis(cached)
-        else:
-            st.info("未解析")
-
-        cols = st.columns([1, 1, 2])
-
-        with cols[0]:
-            if st.button("キャッシュ表示", key=f"show_{uid}") and cached:
-                render_analysis(cached)
-
-        with cols[1]:
-            can_run_ai = show_ai_button and ai_ok and bool(doc_url)
-            run = st.button("AI分析", key=f"ai_{uid}", disabled=not can_run_ai)
-
-        with cols[2]:
             st.caption("※同じPDF URLはSQLiteに保存し、再解析しません（DBはキャッシュ扱い）。")
+            continue  # キャッシュがあればボタン不要（速さ優先）
+
+        st.info("未解析")
+
+        # AI分析可能条件：AI有効 + URLあり + 許可ドメイン
+        allowed = bool(doc_url) and _is_allowed_pdf_url(doc_url)
+        can_run_ai = show_ai_button and ai_ok and allowed
+
+        if doc_url and not allowed:
+            st.warning("安全のため、このPDF URLはAI解析対象外です（release.tdnet.info もしくは yanoshin rd.php 経由のみ許可）。")
+
+        run = st.button("AI分析", key=f"ai_{uid}", disabled=not can_run_ai)
 
         if run:
+            if not _check_pdf_size_or_warn(doc_url, max_pdf_bytes):
+                st.stop()
+
             with st.spinner("AIが決算短信を解析中..."):
                 try:
                     payload = analyze_pdf_to_json(doc_url)
@@ -340,20 +383,31 @@ manual = st.text_input("PDF URL（release.tdnet.info の .pdf 推奨）", value=
 
 colA, colB = st.columns([1, 3])
 with colA:
-    manual_ok = ai_ok and _is_allowed_pdf_url(manual)
+    manual_allowed = _is_allowed_pdf_url(manual)
+    manual_ok = ai_ok and manual_allowed
     manual_run = st.button("AI解析", disabled=not manual_ok)
 
 with colB:
-    if manual and not _is_allowed_pdf_url(manual):
+    if manual and not manual_allowed:
         st.warning("安全のため、release.tdnet.info のPDF（または yanoshin rd.php 経由）以外はブロックしています。")
     else:
         st.caption("※AI有効＋許可ドメインのPDF URLのみ解析します。")
 
 if manual_run:
-    with st.spinner("AIが解析中..."):
-        try:
-            payload = analyze_pdf_to_json(manual)
-            st.success("解析完了")
-            render_analysis(payload)
-        except Exception as e:
-            st.error(f"解析エラー: {type(e).__name__}: {e}")
+    if not _check_pdf_size_or_warn(manual, max_pdf_bytes):
+        st.stop()
+
+    cached = get_cached_analysis(DB_PATH, manual)
+    if cached:
+        st.success("解析済み（キャッシュ）")
+        render_analysis(cached)
+    else:
+        with st.spinner("AIが解析中..."):
+            try:
+                payload = analyze_pdf_to_json(manual)
+                # 手動はコード等が分からないので空で保存（URLキャッシュとして十分）
+                save_analysis(DB_PATH, manual, "", "manual", None, payload)
+                st.success("解析完了")
+                render_analysis(payload)
+            except Exception as e:
+                st.error(f"解析エラー: {type(e).__name__}: {e}")
