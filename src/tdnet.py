@@ -1,74 +1,49 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Any
 
 import requests
 
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # type: ignore
+
 # 非スクレイピングのJSONインデックス（やのしん TDnet WEB-API）
-TDNET_BASE = "https://webapi.yanoshin.jp/webapi/tdnet/list"
+TDNET_BASE = os.getenv("TDNET_BASE", "https://webapi.yanoshin.jp/webapi/tdnet/list")
 
 
 def _parse_dt_maybe(value: str | None) -> datetime | None:
     if not value:
         return None
     s = str(value).strip()
+    if not s:
+        return None
+
+    # よくあるISO形式のZ
     s = s.replace("Z", "+00:00")
-    # "YYYY-MM-DD HH:MM:SS" も来るのでISO寄せ
-    if " " in s and "T" not in s:
-        s = s.replace(" ", "T")
+
+    # "YYYY-mm-dd HH:MM:SS" 形式が来ることがある（スクショの pubdate がこれ）
+    # タイムゾーン情報が無い場合は「JST想定 → UTC変換」して返す
     try:
+        # fromisoformatは "YYYY-mm-dd HH:MM:SS" も通る
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            if ZoneInfo is not None:
+                dt = dt.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+            else:
+                # zoneinfo が無い環境ならUTC扱いにする（誤差は出るが壊れない）
+                dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
 
-def _to_code4(company_code: str | None, code: str | None) -> str:
+def _pick_tdnet_dict(raw: dict[str, Any]) -> dict[str, Any]:
     """
-    TDnet側の company_code は 5桁（例: 45230）が混ざるので、
-    日本株の4桁コード（例: 4523）に寄せる。
-    """
-    if code and str(code).isdigit() and len(str(code)) == 4:
-        return str(code)
-
-    cc = (company_code or "").strip()
-    if cc.isdigit():
-        if len(cc) == 5 and cc.endswith("0"):
-            return cc[:4]
-        if len(cc) == 4:
-            return cc
-    return ""
-
-
-def _unwrap_doc_url(url: str) -> str:
-    """
-    例:
-    https://webapi.yanoshin.jp/rd.php?https://www.release.tdnet.info/inbs/xxx.pdf
-    のような rd.php 形式を TDnetのPDF直リンクに戻す。
-    """
-    u = (url or "").strip()
-    if not u:
-        return ""
-
-    if "webapi.yanoshin.jp/rd.php?" in u:
-        try:
-            return u.split("rd.php?", 1)[1].strip()
-        except Exception:
-            return u
-
-    return u
-
-
-def _pick_td_block(raw: dict[str, Any]) -> dict[str, Any]:
-    """
-    レスポンスの揺れ対策：
-    - "TDnet"
-    - "Tdnet"
-    - "tdnet"
-    のどれでも拾う
+    APIレスポンスのキー揺れ（TDnet / Tdnet / tdnet）に対応。
     """
     for k in ("TDnet", "Tdnet", "tdnet"):
         v = raw.get(k)
@@ -77,25 +52,34 @@ def _pick_td_block(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def _code4_from_company_code(company_code: str) -> str:
+    """
+    '45230' のような5桁が来ることがあるので末尾4桁に寄せる。
+    4桁のときはそのまま。
+    """
+    s = (company_code or "").strip()
+    if not s.isdigit():
+        return ""
+    if len(s) == 4:
+        return s
+    if len(s) >= 4:
+        return s[-4:]
+    return ""
+
+
 def _normalize_item(raw: dict[str, Any]) -> dict[str, Any]:
-    """
-    APIレスポンスの揺れに耐える正規化。
-    """
-    td = _pick_td_block(raw)
+    td = _pick_tdnet_dict(raw)
 
     title = td.get("title") or td.get("Title") or ""
-    company_name = td.get("company_name") or td.get("companyName") or ""
-
-    # 4桁/5桁の揺れ対策
-    company_code = str(
+    # company_code / code が揺れる
+    company_code = (
         td.get("company_code")
-        or td.get("companyCode")
+        or td.get("CompanyCode")
         or td.get("code")
+        or td.get("Code")
         or ""
-    ).strip()
-
-    code = str(td.get("code") or td.get("Code") or "").strip()
-    code4 = _to_code4(company_code, code)
+    )
+    company_name = td.get("company_name") or td.get("CompanyName") or ""
 
     # URLキーが揺れた場合に備える
     doc_url = (
@@ -105,21 +89,19 @@ def _normalize_item(raw: dict[str, Any]) -> dict[str, Any]:
         or td.get("url")
         or ""
     )
-    doc_url = _unwrap_doc_url(str(doc_url))
 
     published_raw = td.get("published_at") or td.get("pubdate") or td.get("date") or ""
-    published_at = _parse_dt_maybe(str(published_raw))
+    published_at = _parse_dt_maybe(published_raw)
 
-    link = td.get("link") or ""
+    company_code_s = str(company_code) if company_code is not None else ""
+    code4 = _code4_from_company_code(company_code_s)
 
     return {
         "title": str(title),
-        "company_name": str(company_name),
-        "company_code": company_code,  # 5桁が来ることもある
-        "code": code4,                 # UIで使うのは4桁
+        "company_code": company_code_s,
         "code4": code4,
+        "company_name": str(company_name),
         "doc_url": str(doc_url),
-        "link": str(link),
         "published_at": published_at,
         "raw": td,
     }
@@ -127,20 +109,20 @@ def _normalize_item(raw: dict[str, Any]) -> dict[str, Any]:
 
 def fetch_tdnet_items(code: str | None, limit: int = 200) -> list[dict[str, Any]]:
     """
-    code があれば銘柄別、なければ recent。
+    code があれば銘柄別、なければrecent。
     """
-    code = (code or "").strip()
-    if code.isdigit() and len(code) == 4:
+    if code and code.isdigit() and len(code) == 4:
         url = f"{TDNET_BASE}/{code}.json?limit={limit}"
     else:
         url = f"{TDNET_BASE}/recent.json?limit={limit}"
 
-    r = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+    r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     data = r.json()
 
     items = data.get("items")
     if not isinstance(items, list):
+        # 万一形が違ったら空で返す（壊れにくさ優先）
         return []
 
     out: list[dict[str, Any]] = []
